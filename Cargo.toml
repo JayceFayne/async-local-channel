@@ -1,0 +1,14 @@
+[package]
+name = "async-local-channel"
+version = "0.1.0"
+authors = ["Jayce Fayne <jayce.fayne@mailbox.org>"]
+repository = "https://github.com/jaycefayne/async-local-channel"
+edition = "2024"
+description = "Lightweight channels for single-threaded async runtimes."
+license = "MIT"
+categories = ["asynchronous", "concurrency", "data-structures"]
+keywords = ["chan", "futures", "mpmc", "channel", "async"]
+readme = "README.md"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
