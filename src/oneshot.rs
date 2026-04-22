@@ -1,3 +1,4 @@
+use crate::{RecvError, SendError};
 use alloc::rc::Rc;
 use core::cell::RefCell;
 use core::future::Future;
@@ -8,6 +9,8 @@ use core::task::{Context, Poll, Waker};
 struct Inner<T> {
     value: Option<T>,
     waker: Option<Waker>,
+    sender: bool,
+    receiver: bool,
 }
 
 #[derive(Debug)]
@@ -16,10 +19,33 @@ pub struct Sender<T> {
 }
 
 impl<T> Sender<T> {
-    pub fn send(self, value: T) {
-        let mut inner = self.inner.borrow_mut();
-        inner.value = Some(value);
+    pub fn is_closed(&self) -> bool {
+        Rc::strong_count(&self.inner) == 1
+    }
 
+    pub fn send(self, value: T) -> Result<Option<usize>, SendError<T>> {
+        let is_closed = self.is_closed();
+        let mut inner = self.inner.borrow_mut();
+        if !inner.receiver {
+            return Ok(None);
+        }
+        if is_closed {
+            return Err(SendError(value));
+        }
+        inner.value = Some(value);
+        Ok(Some(if let Some(waker) = inner.waker.take() {
+            waker.wake();
+            1
+        } else {
+            0
+        }))
+    }
+}
+
+impl<T> Drop for Sender<T> {
+    fn drop(&mut self) {
+        let mut inner = self.inner.borrow_mut();
+        inner.sender = false;
         if let Some(waker) = inner.waker.take() {
             waker.wake();
         }
@@ -32,37 +58,72 @@ pub struct Receiver<T> {
 }
 
 impl<T> Receiver<T> {
+    pub fn is_closed(&self) -> bool {
+        !self.inner.borrow().sender
+    }
+
+    pub fn recv(&self) -> RecvFuture<'_, T> {
+        RecvFuture { rx: self }
+    }
+
     pub fn try_recv(&self) -> Option<T> {
         self.inner.borrow_mut().value.take()
     }
-}
 
-impl<T> Future for Receiver<T> {
-    type Output = T;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
-        let mut inner = self.inner.borrow_mut();
-
-        if let Some(value) = inner.value.take() {
-            Poll::Ready(value)
-        } else {
-            inner.waker = Some(cx.waker().clone());
-            Poll::Pending
+    pub fn deactivate(self) -> InactiveReceiver<T> {
+        InactiveReceiver {
+            inner: self.inner.clone(),
         }
     }
 }
 
-pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
+pub struct RecvFuture<'a, T> {
+    rx: &'a Receiver<T>,
+}
+
+impl<'a, T: Clone> Future for RecvFuture<'a, T> {
+    type Output = Result<T, RecvError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut inner = self.rx.inner.borrow_mut();
+        if let Some(value) = inner.value.take() {
+            Poll::Ready(Ok(value))
+        } else {
+            if inner.sender {
+                inner.waker = Some(cx.waker().clone());
+                Poll::Pending
+            } else {
+                Poll::Ready(Err(RecvError))
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct InactiveReceiver<T> {
+    inner: Rc<RefCell<Inner<T>>>,
+}
+
+impl<T> InactiveReceiver<T> {
+    pub fn activate(self) -> Receiver<T> {
+        self.inner.borrow_mut().receiver = true;
+        Receiver { inner: self.inner }
+    }
+}
+
+pub fn channel<T>() -> (Sender<T>, InactiveReceiver<T>) {
     let inner = Rc::new(RefCell::new(Inner {
         value: None,
         waker: None,
+        sender: true,
+        receiver: false,
     }));
 
     (
         Sender {
             inner: inner.clone(),
         },
-        Receiver { inner },
+        InactiveReceiver { inner },
     )
 }
 
@@ -75,9 +136,10 @@ mod tests {
     #[tokio::test(flavor = "local")]
     async fn send_before() {
         let (tx, rx) = channel();
-        tx.send(true);
+        let rx = rx.activate();
+        tx.send(true).unwrap();
         spawn_local(async move {
-            assert!(rx.await);
+            assert!(rx.recv().await.unwrap());
         })
         .await
         .unwrap();
@@ -85,11 +147,12 @@ mod tests {
 
     #[tokio::test(flavor = "local")]
     async fn send_after() {
-        let (tx, rx) = channel();
+        let (tx, rx) = channel::<bool>();
+        let rx = rx.activate();
         let handle = spawn_local(async move {
-            assert!(rx.await);
+            assert!(rx.recv().await.unwrap());
         });
-        tx.send(true);
+        tx.send(true).unwrap();
         handle.await.unwrap();
     }
 }

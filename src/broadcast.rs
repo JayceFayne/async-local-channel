@@ -1,3 +1,4 @@
+use crate::{RecvError, SendError};
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
@@ -9,7 +10,8 @@ use core::task::{Context, Poll, Waker};
 struct Inner<T> {
     queue: Vec<T>,
     wakers: Vec<Waker>,
-    listener: usize,
+    sender: usize,
+    receiver: usize,
 }
 
 #[derive(Debug)]
@@ -19,24 +21,47 @@ pub struct Sender<T> {
 
 impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
+        self.inner.borrow_mut().sender += 1;
         Self {
             inner: self.inner.clone(),
         }
     }
 }
 
-impl<T> Sender<T> {
-    pub fn send(&self, value: T) {
+impl<T> Drop for Sender<T> {
+    fn drop(&mut self) {
         let mut inner = self.inner.borrow_mut();
-        if inner.listener == 0 {
-            return;
+        inner.sender -= 1;
+        if inner.sender == 0 {
+            for waker in inner.wakers.drain(..) {
+                waker.wake();
+            }
         }
+    }
+}
 
+impl<T> Sender<T> {
+    pub fn is_closed(&self) -> bool {
+        let total = Rc::strong_count(&self.inner);
+        let inner = self.inner.borrow();
+        inner.receiver == 0 && total != inner.receiver + inner.sender
+    }
+
+    pub fn send(&self, value: T) -> Result<Option<usize>, SendError<T>> {
+        let is_closed = self.is_closed();
+        let mut inner = self.inner.borrow_mut();
+        if inner.receiver == 0 {
+            return Ok(None);
+        }
+        if is_closed {
+            return Err(SendError(value));
+        }
         inner.queue.push(value);
-
-        for w in inner.wakers.drain(..) {
-            w.wake();
+        let woken = inner.wakers.len();
+        for waker in inner.wakers.drain(..) {
+            waker.wake();
         }
+        Ok(Some(woken))
     }
 }
 
@@ -46,19 +71,44 @@ pub struct Receiver<T> {
     index: usize,
 }
 
-impl<T> Drop for Receiver<T> {
-    fn drop(&mut self) {
-        let mut inner = self.inner.borrow_mut();
-        inner.listener -= 1;
-        if inner.listener == 0 {
-            inner.queue.clear();
+impl<T> Receiver<T> {
+    fn new(inner: Rc<RefCell<Inner<T>>>, index: usize) -> Receiver<T> {
+        inner.borrow_mut().receiver += 1;
+        Self { inner, index }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.inner.borrow().sender == 0
+    }
+
+    pub fn recv(&mut self) -> RecvFuture<'_, T> {
+        RecvFuture { rx: self }
+    }
+
+    pub fn deactivate(self) -> InactiveReceiver<T> {
+        InactiveReceiver {
+            inner: self.inner.clone(),
         }
     }
 }
 
-impl<T> Receiver<T> {
-    pub fn recv(&mut self) -> RecvFuture<'_, T> {
-        RecvFuture { rx: self }
+impl<T: Clone> Receiver<T> {
+    pub fn try_recv(&mut self) -> Option<T> {
+        let value = self.inner.borrow_mut().queue.get(self.index)?.clone();
+        self.index += 1;
+        Some(value)
+    }
+}
+
+impl<T> Clone for Receiver<T> {
+    fn clone(&self) -> Self {
+        Self::new(self.inner.clone(), self.index)
+    }
+}
+
+impl<T> Drop for Receiver<T> {
+    fn drop(&mut self) {
+        self.inner.borrow_mut().receiver -= 1;
     }
 }
 
@@ -67,23 +117,26 @@ pub struct RecvFuture<'a, T> {
 }
 
 impl<'a, T: Clone> Future for RecvFuture<'a, T> {
-    type Output = T;
+    type Output = Result<T, RecvError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let rx = &mut self.get_mut().rx;
         let mut inner = rx.inner.borrow_mut();
-
         if rx.index == inner.queue.len() {
-            rx.index = 0;
-            inner.wakers.push(cx.waker().clone());
-            if inner.listener == inner.wakers.len() {
-                inner.queue.clear();
+            if inner.sender == 0 {
+                Poll::Ready(Err(RecvError))
+            } else {
+                inner.wakers.push(cx.waker().clone());
+                if inner.receiver == inner.wakers.len() {
+                    inner.queue.clear();
+                    rx.index = 0;
+                }
+                Poll::Pending
             }
-            Poll::Pending
         } else {
             let value = inner.queue[rx.index].clone();
             rx.index += 1;
-            Poll::Ready(value)
+            Poll::Ready(Ok(value))
         }
     }
 }
@@ -102,12 +155,8 @@ impl<T> Clone for InactiveReceiver<T> {
 }
 
 impl<T> InactiveReceiver<T> {
-    pub fn resubscribe(&self) -> Receiver<T> {
-        self.inner.borrow_mut().listener += 1;
-        Receiver {
-            inner: self.inner.clone(),
-            index: 0,
-        }
+    pub fn activate(self) -> Receiver<T> {
+        Receiver::new(self.inner, 0)
     }
 }
 
@@ -115,7 +164,8 @@ pub fn channel<T>() -> (Sender<T>, InactiveReceiver<T>) {
     let inner = Rc::new(RefCell::new(Inner {
         queue: Vec::new(),
         wakers: Vec::new(),
-        listener: 0,
+        sender: 1,
+        receiver: 0,
     }));
 
     let tx = Sender {
@@ -128,6 +178,8 @@ pub fn channel<T>() -> (Sender<T>, InactiveReceiver<T>) {
 
 #[cfg(test)]
 mod tests {
+    use core::mem;
+
     use tokio::task::{JoinHandle, spawn_local};
 
     use super::*;
@@ -136,19 +188,19 @@ mod tests {
     async fn send_before() {
         let (tx, rx) = channel();
         for i in 0..10 {
-            tx.send(Some(i));
+            tx.send(i).unwrap();
         }
 
         let handle: Vec<JoinHandle<()>> = (0..10)
             .map(|_| {
-                let mut rx = rx.resubscribe();
+                let mut rx = rx.clone().activate();
                 spawn_local(async move {
-                    assert!(rx.recv().await.is_none());
+                    assert!(rx.recv().await.is_err());
                 })
             })
             .collect();
 
-        tx.send(None);
+        mem::drop(tx);
         for handle in handle {
             handle.await.unwrap();
         }
@@ -160,10 +212,10 @@ mod tests {
 
         let handle: Vec<JoinHandle<()>> = (0..10)
             .map(|_| {
-                let mut rx = rx.resubscribe();
+                let mut rx = rx.clone().activate();
                 spawn_local(async move {
                     let mut i = 0;
-                    while let Some(value) = rx.recv().await {
+                    while let Ok(value) = rx.recv().await {
                         i += value;
                     }
                     assert_eq!(i, 45);
@@ -172,9 +224,9 @@ mod tests {
             .collect();
 
         for i in 0..10 {
-            tx.send(Some(i));
+            tx.send(i).unwrap();
         }
-        tx.send(None);
+        mem::drop(tx);
 
         for handle in handle {
             handle.await.unwrap();

@@ -13,7 +13,7 @@ Lightweight channels for single-threaded async runtimes.
 
 ## Why?
 
-There are lots of async channel libraries out there. But this one is built specifically for single-threaded async runtimes. All channels are `!Send` and therefore don't use any locks, additionally they are unbounded (with the exception of `oneshot`).
+There are lots of async channel libraries out there. But this one is built specifically for single-threaded async runtimes. All channels are `!Send` and therefore don't use any locks, additionally they are unbounded (with the exception of `oneshot` and `watch`).
 
 ## Contributing
 
