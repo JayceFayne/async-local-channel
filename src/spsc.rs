@@ -10,7 +10,6 @@ use core::task::{Context, Poll, Waker};
 struct Inner<T> {
     queue: VecDeque<T>,
     waker: Option<Waker>,
-    sender: bool,
     receiver: bool,
 }
 
@@ -46,7 +45,6 @@ impl<T> Sender<T> {
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         let mut inner = self.inner.borrow_mut();
-        inner.sender = false;
         if let Some(waker) = inner.waker.take() {
             waker.wake();
         }
@@ -58,15 +56,9 @@ pub struct Receiver<T> {
     inner: Rc<RefCell<Inner<T>>>,
 }
 
-impl<T> Drop for Receiver<T> {
-    fn drop(&mut self) {
-        self.inner.borrow_mut().sender = false;
-    }
-}
-
 impl<T> Receiver<T> {
     pub fn is_closed(&self) -> bool {
-        !self.inner.borrow().sender
+        Rc::strong_count(&self.inner) == 1
     }
 
     pub fn recv(&self) -> RecvFuture<'_, T> {
@@ -96,11 +88,11 @@ impl<'a, T: Clone> Future for RecvFuture<'a, T> {
         if let Some(value) = inner.queue.pop_front() {
             Poll::Ready(Ok(value))
         } else {
-            if inner.sender {
+            if Rc::strong_count(&self.rx.inner) == 1 {
+                Poll::Ready(Err(RecvError))
+            } else {
                 inner.waker = Some(cx.waker().clone());
                 Poll::Pending
-            } else {
-                Poll::Ready(Err(RecvError))
             }
         }
     }
@@ -122,7 +114,6 @@ pub fn channel<T>() -> (Sender<T>, InactiveReceiver<T>) {
     let inner = Rc::new(RefCell::new(Inner {
         queue: VecDeque::new(),
         waker: None,
-        sender: true,
         receiver: false,
     }));
 
