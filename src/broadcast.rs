@@ -123,13 +123,13 @@ impl<'a, T: Clone> Future for RecvFuture<'a, T> {
         let rx = &mut self.get_mut().rx;
         let mut inner = rx.inner.borrow_mut();
         if rx.index == inner.queue.len() {
+            rx.index = 0; //FIXME: 
             if inner.sender == 0 {
                 Poll::Ready(Err(RecvError))
             } else {
                 inner.wakers.push(cx.waker().clone());
                 if inner.receiver == inner.wakers.len() {
                     inner.queue.clear();
-                    rx.index = 0;
                 }
                 Poll::Pending
             }
