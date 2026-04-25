@@ -79,7 +79,7 @@ pub struct RecvFuture<'a, T> {
     rx: &'a Receiver<T>,
 }
 
-impl<'a, T: Clone> Future for RecvFuture<'a, T> {
+impl<'a, T> Future for RecvFuture<'a, T> {
     type Output = Result<T, RecvError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
