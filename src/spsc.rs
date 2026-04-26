@@ -40,6 +40,14 @@ impl<T> Sender<T> {
             0
         }))
     }
+
+    pub fn len(&self) -> usize {
+        self.inner.borrow().queue.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.borrow().queue.is_empty()
+    }
 }
 
 impl<T> Drop for Sender<T> {
@@ -74,6 +82,14 @@ impl<T> Receiver<T> {
             inner: self.inner.clone(),
         }
     }
+
+    pub fn len(&self) -> usize {
+        self.inner.borrow().queue.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.borrow().queue.is_empty()
+    }
 }
 
 pub struct RecvFuture<'a, T> {
@@ -107,6 +123,14 @@ impl<T> InactiveReceiver<T> {
     pub fn activate(self) -> Receiver<T> {
         self.inner.borrow_mut().receiver = true;
         Receiver { inner: self.inner }
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.borrow().queue.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.borrow().queue.is_empty()
     }
 }
 

@@ -63,6 +63,14 @@ impl<T> Sender<T> {
         }
         Ok(Some(woken))
     }
+
+    pub fn len(&self) -> usize {
+        self.inner.borrow().queue.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.borrow().queue.is_empty()
+    }
 }
 
 #[derive(Debug)]
@@ -89,6 +97,14 @@ impl<T> Receiver<T> {
         InactiveReceiver {
             inner: self.inner.clone(),
         }
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.borrow().queue.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.borrow().queue.is_empty()
     }
 }
 
@@ -157,6 +173,14 @@ impl<T> Clone for InactiveReceiver<T> {
 impl<T> InactiveReceiver<T> {
     pub fn activate(self) -> Receiver<T> {
         Receiver::new(self.inner, 0)
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.borrow().queue.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.borrow().queue.is_empty()
     }
 }
 
