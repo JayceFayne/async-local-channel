@@ -80,7 +80,7 @@ impl<T> Receiver<T> {
         self.inner.borrow().sender == 0
     }
 
-    pub fn recv(&mut self) -> RecvFuture<'_, T> {
+    pub fn recv(&self) -> RecvFuture<'_, T> {
         RecvFuture { rx: self }
     }
 
@@ -92,7 +92,7 @@ impl<T> Receiver<T> {
 }
 
 impl<T: Clone> Receiver<T> {
-    pub fn try_recv(&mut self) -> Option<T> {
+    pub fn try_recv(&self) -> Option<T> {
         self.inner.borrow().value.clone()
     }
 }
@@ -110,7 +110,7 @@ impl<T> Drop for Receiver<T> {
 }
 
 pub struct RecvFuture<'a, T> {
-    rx: &'a mut Receiver<T>,
+    rx: &'a Receiver<T>,
 }
 
 impl<'a, T: Clone> Future for RecvFuture<'a, T> {
@@ -176,6 +176,24 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "local")]
+    async fn keep_last() {
+        let (tx, rx) = channel();
+        let rx = rx.activate();
+        for i in 0..10 {
+            tx.send(i).unwrap();
+        }
+
+        let value = rx.recv().await.unwrap();
+        assert_eq!(value, 9);
+
+        let handle = spawn_local(async move {
+            assert_eq!(rx.recv().await.unwrap(), 10);
+        });
+        tx.send(10).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "local")]
     async fn send_before() {
         let (tx, rx) = channel();
         for i in 0..10 {
@@ -184,7 +202,7 @@ mod tests {
 
         let handle: Vec<JoinHandle<()>> = (0..10)
             .map(|_| {
-                let mut rx = rx.clone().activate();
+                let rx = rx.clone().activate();
                 spawn_local(async move {
                     assert!(rx.recv().await.is_err());
                 })
@@ -203,7 +221,7 @@ mod tests {
 
         let handle: Vec<JoinHandle<()>> = (0..10)
             .map(|_| {
-                let mut rx = rx.clone().activate();
+                let rx = rx.clone().activate();
                 spawn_local(async move {
                     assert_eq!(rx.recv().await.unwrap(), 9);
                 })
