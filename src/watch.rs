@@ -12,6 +12,7 @@ struct Inner<T> {
     wakers: Vec<Waker>,
     sender: usize,
     receiver: usize,
+    id: usize,
 }
 
 #[derive(Debug)]
@@ -57,6 +58,7 @@ impl<T> Sender<T> {
             return Err(SendError(value));
         }
         inner.value = Some(value);
+        inner.id = inner.id.wrapping_add(1);
         let woken = inner.wakers.len();
         for waker in inner.wakers.drain(..) {
             waker.wake();
@@ -68,19 +70,21 @@ impl<T> Sender<T> {
 #[derive(Debug)]
 pub struct Receiver<T> {
     inner: Rc<RefCell<Inner<T>>>,
+    id: usize,
 }
 
 impl<T> Receiver<T> {
     fn new(inner: Rc<RefCell<Inner<T>>>) -> Receiver<T> {
         inner.borrow_mut().receiver += 1;
-        Self { inner }
+        let id = inner.borrow().id;
+        Self { inner, id }
     }
 
     pub fn is_closed(&self) -> bool {
         self.inner.borrow().sender == 0
     }
 
-    pub fn recv(&self) -> RecvFuture<'_, T> {
+    pub fn recv(&mut self) -> RecvFuture<'_, T> {
         RecvFuture { rx: self }
     }
 
@@ -110,7 +114,7 @@ impl<T> Drop for Receiver<T> {
 }
 
 pub struct RecvFuture<'a, T> {
-    rx: &'a Receiver<T>,
+    rx: &'a mut Receiver<T>,
 }
 
 impl<'a, T: Clone> Future for RecvFuture<'a, T> {
@@ -119,7 +123,10 @@ impl<'a, T: Clone> Future for RecvFuture<'a, T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let rx = &mut self.get_mut().rx;
         let mut inner = rx.inner.borrow_mut();
-        if let Some(value) = inner.value.clone() {
+        if let Some(value) = inner.value.clone()
+            && rx.id != inner.id
+        {
+            rx.id = inner.id;
             Poll::Ready(Ok(value))
         } else {
             if inner.sender == 0 {
@@ -157,6 +164,7 @@ pub fn channel<T>() -> (Sender<T>, InactiveReceiver<T>) {
         wakers: Vec::new(),
         sender: 1,
         receiver: 0,
+        id: 0,
     }));
 
     let tx = Sender {
@@ -176,9 +184,24 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "local")]
+    async fn wait_for_change() {
+        let (tx, rx) = channel();
+        let mut rx = rx.activate();
+        tx.send(1).unwrap();
+        let value = rx.recv().await.unwrap();
+        assert_eq!(value, 1);
+        let handle = spawn_local(async move {
+            tx.send(2).unwrap();
+        });
+        handle.await.unwrap();
+        let value = rx.recv().await.unwrap();
+        assert_eq!(value, 2);
+    }
+
+    #[tokio::test(flavor = "local")]
     async fn keep_last() {
         let (tx, rx) = channel();
-        let rx = rx.activate();
+        let mut rx = rx.activate();
         for i in 0..10 {
             tx.send(i).unwrap();
         }
@@ -202,7 +225,7 @@ mod tests {
 
         let handle: Vec<JoinHandle<()>> = (0..10)
             .map(|_| {
-                let rx = rx.clone().activate();
+                let mut rx = rx.clone().activate();
                 spawn_local(async move {
                     assert!(rx.recv().await.is_err());
                 })
@@ -221,7 +244,7 @@ mod tests {
 
         let handle: Vec<JoinHandle<()>> = (0..10)
             .map(|_| {
-                let rx = rx.clone().activate();
+                let mut rx = rx.clone().activate();
                 spawn_local(async move {
                     assert_eq!(rx.recv().await.unwrap(), 9);
                 })
