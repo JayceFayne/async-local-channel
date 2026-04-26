@@ -70,13 +70,13 @@ impl<T> Sender<T> {
 #[derive(Debug)]
 pub struct Receiver<T> {
     inner: Rc<RefCell<Inner<T>>>,
-    id: usize,
+    id: RefCell<usize>,
 }
 
 impl<T> Receiver<T> {
     fn new(inner: Rc<RefCell<Inner<T>>>) -> Receiver<T> {
         inner.borrow_mut().receiver += 1;
-        let id = inner.borrow().id;
+        let id = RefCell::new(inner.borrow().id);
         Self { inner, id }
     }
 
@@ -84,7 +84,7 @@ impl<T> Receiver<T> {
         self.inner.borrow().sender == 0
     }
 
-    pub fn recv(&mut self) -> RecvFuture<'_, T> {
+    pub fn recv(&self) -> RecvFuture<'_, T> {
         RecvFuture { rx: self }
     }
 
@@ -114,7 +114,7 @@ impl<T> Drop for Receiver<T> {
 }
 
 pub struct RecvFuture<'a, T> {
-    rx: &'a mut Receiver<T>,
+    rx: &'a Receiver<T>,
 }
 
 impl<'a, T: Clone> Future for RecvFuture<'a, T> {
@@ -124,9 +124,9 @@ impl<'a, T: Clone> Future for RecvFuture<'a, T> {
         let rx = &mut self.get_mut().rx;
         let mut inner = rx.inner.borrow_mut();
         if let Some(value) = inner.value.clone()
-            && rx.id != inner.id
+            && *rx.id.borrow() != inner.id
         {
-            rx.id = inner.id;
+            *rx.id.borrow_mut() = inner.id;
             Poll::Ready(Ok(value))
         } else {
             if inner.sender == 0 {
@@ -186,7 +186,7 @@ mod tests {
     #[tokio::test(flavor = "local")]
     async fn wait_for_change() {
         let (tx, rx) = channel();
-        let mut rx = rx.activate();
+        let rx = rx.activate();
         tx.send(1).unwrap();
         let value = rx.recv().await.unwrap();
         assert_eq!(value, 1);
@@ -201,7 +201,7 @@ mod tests {
     #[tokio::test(flavor = "local")]
     async fn keep_last() {
         let (tx, rx) = channel();
-        let mut rx = rx.activate();
+        let rx = rx.activate();
         for i in 0..10 {
             tx.send(i).unwrap();
         }
@@ -225,7 +225,7 @@ mod tests {
 
         let handle: Vec<JoinHandle<()>> = (0..10)
             .map(|_| {
-                let mut rx = rx.clone().activate();
+                let rx = rx.clone().activate();
                 spawn_local(async move {
                     assert!(rx.recv().await.is_err());
                 })
@@ -244,7 +244,7 @@ mod tests {
 
         let handle: Vec<JoinHandle<()>> = (0..10)
             .map(|_| {
-                let mut rx = rx.clone().activate();
+                let rx = rx.clone().activate();
                 spawn_local(async move {
                     assert_eq!(rx.recv().await.unwrap(), 9);
                 })
