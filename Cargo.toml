@@ -1,6 +1,6 @@
 [package]
 name = "async-local-channel"
-version = "0.3.0"
+version = "0.4.0"
 authors = ["Jayce Fayne <jayce.fayne@mailbox.org>"]
 repository = "https://github.com/jaycefayne/async-local-channel"
 edition = "2024"
