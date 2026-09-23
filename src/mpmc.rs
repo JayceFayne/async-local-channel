@@ -89,7 +89,7 @@ impl<T> Receiver<T> {
         self.inner.borrow().sender == 0
     }
 
-    pub fn recv(&self) -> RecvFuture<'_, T> {
+    pub const fn recv(&self) -> RecvFuture<'_, T> {
         RecvFuture { rx: self }
     }
 

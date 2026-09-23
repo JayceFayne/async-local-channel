@@ -69,7 +69,7 @@ impl<T> Receiver<T> {
         Rc::strong_count(&self.inner) == 1
     }
 
-    pub fn recv(&self) -> RecvFuture<'_, T> {
+    pub const fn recv(&self) -> RecvFuture<'_, T> {
         RecvFuture { rx: self }
     }
 
