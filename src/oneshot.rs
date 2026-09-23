@@ -18,10 +18,12 @@ pub struct Sender<T> {
 }
 
 impl<T> Sender<T> {
+    #[inline]
     pub fn is_closed(&self) -> bool {
         Rc::strong_count(&self.inner) == 1
     }
 
+    #[inline]
     pub fn send(self, value: T) -> Result<Option<usize>, SendError<T>> {
         let is_closed = self.is_closed();
         let mut inner = self.inner.borrow_mut();
@@ -42,6 +44,7 @@ impl<T> Sender<T> {
 }
 
 impl<T> Drop for Sender<T> {
+    #[inline]
     fn drop(&mut self) {
         let mut inner = self.inner.borrow_mut();
         if let Some(waker) = inner.waker.take() {
@@ -56,18 +59,22 @@ pub struct Receiver<T> {
 }
 
 impl<T> Receiver<T> {
+    #[inline]
     pub fn is_closed(&self) -> bool {
         Rc::strong_count(&self.inner) == 1
     }
 
+    #[inline]
     pub const fn recv(&self) -> RecvFuture<'_, T> {
         RecvFuture { rx: self }
     }
 
+    #[inline]
     pub fn try_recv(&self) -> Option<T> {
         self.inner.borrow_mut().value.take()
     }
 
+    #[inline]
     pub fn deactivate(self) -> InactiveReceiver<T> {
         InactiveReceiver {
             inner: self.inner.clone(),
@@ -82,6 +89,7 @@ pub struct RecvFuture<'a, T> {
 impl<'a, T> Future for RecvFuture<'a, T> {
     type Output = Result<T, RecvError>;
 
+    #[inline]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut inner = self.rx.inner.borrow_mut();
         if let Some(value) = inner.value.take() {
@@ -103,12 +111,14 @@ pub struct InactiveReceiver<T> {
 }
 
 impl<T> InactiveReceiver<T> {
+    #[inline]
     pub fn activate(self) -> Receiver<T> {
         self.inner.borrow_mut().receiver = true;
         Receiver { inner: self.inner }
     }
 }
 
+#[inline]
 pub fn channel<T>() -> (Sender<T>, InactiveReceiver<T>) {
     let inner = Rc::new(RefCell::new(Inner {
         value: None,
