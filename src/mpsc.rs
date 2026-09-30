@@ -72,8 +72,8 @@ impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         let mut inner = self.inner.borrow_mut();
         inner.sender -= 1;
-        if let Some(waker) = inner.waker.take()
-            && inner.sender == 0
+        if inner.sender == 0
+            && let Some(waker) = inner.waker.take()
         {
             waker.wake();
         }
