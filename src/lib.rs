@@ -3,7 +3,6 @@
 #![no_std]
 extern crate alloc;
 
-pub mod broadcast;
 mod error;
 pub mod mpmc;
 pub mod mpsc;
