@@ -142,7 +142,11 @@ impl<'a, T> Future for RecvFuture<'a, T> {
             if inner.sender == 0 {
                 Poll::Ready(Err(RecvError))
             } else {
-                inner.waker = Some(cx.waker().clone());
+                if let Some(waker) = inner.waker.as_mut() {
+                    waker.clone_from(cx.waker());
+                } else {
+                    inner.waker = Some(cx.waker().clone());
+                }
                 Poll::Pending
             }
         }
