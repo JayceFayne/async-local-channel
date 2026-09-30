@@ -10,5 +10,8 @@ categories = ["asynchronous", "concurrency", "data-structures"]
 keywords = ["chan", "futures", "mpmc", "channel", "async"]
 readme = "README.md"
 
+[dependencies]
+slotmap = { version = "1", default-features = true }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

@@ -1,16 +1,16 @@
 use crate::{RecvError, SendError};
 use alloc::collections::vec_deque::VecDeque;
 use alloc::rc::Rc;
-use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
+use slotmap::{DefaultKey, SlotMap};
 
 #[derive(Debug)]
 struct Inner<T> {
     queue: VecDeque<T>,
-    wakers: Vec<Waker>,
+    wakers: SlotMap<DefaultKey, Waker>,
     sender: usize,
     receiver: usize,
 }
@@ -50,7 +50,7 @@ impl<T> Sender<T> {
         }
         inner.queue.push_back(value);
         let woken = inner.wakers.len();
-        for waker in inner.wakers.drain(..) {
+        for (_, waker) in inner.wakers.drain() {
             waker.wake();
         }
         Ok(Some(woken))
@@ -73,8 +73,8 @@ impl<T> Drop for Sender<T> {
         let mut inner = self.inner.borrow_mut();
         inner.sender -= 1;
         if inner.sender == 0 {
-            for w in inner.wakers.drain(..) {
-                w.wake();
+            for (_, waker) in inner.wakers.drain() {
+                waker.wake();
             }
         }
     }
@@ -98,7 +98,10 @@ impl<T> Receiver<T> {
 
     #[inline]
     pub const fn recv(&self) -> RecvFuture<'_, T> {
-        RecvFuture { rx: self }
+        RecvFuture {
+            rx: self,
+            waker_key: None,
+        }
     }
 
     #[inline]
@@ -140,13 +143,14 @@ impl<T> Drop for Receiver<T> {
 
 pub struct RecvFuture<'a, T> {
     rx: &'a Receiver<T>,
+    waker_key: Option<DefaultKey>,
 }
 
 impl<'a, T> Future for RecvFuture<'a, T> {
     type Output = Result<T, RecvError>;
 
     #[inline]
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut inner = self.rx.inner.borrow_mut();
         if let Some(value) = inner.queue.pop_front() {
             Poll::Ready(Ok(value))
@@ -154,9 +158,23 @@ impl<'a, T> Future for RecvFuture<'a, T> {
             if inner.sender == 0 {
                 Poll::Ready(Err(RecvError))
             } else {
-                inner.wakers.push(cx.waker().clone());
+                if let Some(waker_key) = self.waker_key
+                    && let Some(waker) = inner.wakers.get_mut(waker_key)
+                {
+                    waker.clone_from(cx.waker());
+                } else {
+                    self.waker_key = Some(inner.wakers.insert(cx.waker().clone()));
+                }
                 Poll::Pending
             }
+        }
+    }
+}
+
+impl<T> Drop for RecvFuture<'_, T> {
+    fn drop(&mut self) {
+        if let Some(waker_key) = self.waker_key {
+            self.rx.inner.borrow_mut().wakers.remove(waker_key);
         }
     }
 }
@@ -196,7 +214,7 @@ impl<T> InactiveReceiver<T> {
 pub fn channel<T>() -> (Sender<T>, InactiveReceiver<T>) {
     let inner = Rc::new(RefCell::new(Inner {
         queue: VecDeque::new(),
-        wakers: Vec::new(),
+        wakers: SlotMap::new(),
         sender: 1,
         receiver: 0,
     }));
