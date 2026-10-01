@@ -28,22 +28,20 @@ impl<T> Sender<T> {
     }
 
     #[inline]
-    pub fn send(&self, value: T) -> Result<Option<usize>, SendError<T>> {
+    pub fn send(&self, value: T) -> Result<Option<T>, SendError<T>> {
         let is_closed = self.is_closed();
         let mut inner = self.inner.borrow_mut();
         if inner.receiver == 0 {
-            return Ok(None);
+            return Ok(Some(value));
         }
         if is_closed {
             return Err(SendError(value));
         }
         inner.queue.push_back(value);
-        Ok(Some(if let Some(waker) = inner.waker.take() {
+        if let Some(waker) = inner.waker.take() {
             waker.wake();
-            inner.receiver as usize
-        } else {
-            0
-        }))
+        }
+        Ok(None)
     }
 
     #[inline]
