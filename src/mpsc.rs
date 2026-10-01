@@ -2,16 +2,15 @@ use crate::{RecvError, SendError};
 use alloc::collections::vec_deque::VecDeque;
 use alloc::rc::Rc;
 use core::cell::RefCell;
-use core::future::Future;
-use core::pin::Pin;
-use core::task::{Context, Poll, Waker};
+use core::future::poll_fn;
+use core::task::{Poll, Waker};
 
 #[derive(Debug)]
 struct Inner<T> {
     queue: VecDeque<T>,
     waker: Option<Waker>,
     sender: usize,
-    receiver: u8,
+    receiver: bool,
 }
 
 #[derive(Debug)]
@@ -22,20 +21,17 @@ pub struct Sender<T> {
 impl<T> Sender<T> {
     #[inline]
     pub fn is_closed(&self) -> bool {
-        let total = Rc::strong_count(&self.inner);
-        let inner = self.inner.borrow();
-        inner.receiver as usize == 0 && total != inner.receiver as usize + inner.sender
+        Rc::strong_count(&self.inner) == self.inner.borrow().sender
     }
 
     #[inline]
     pub fn send(&self, value: T) -> Result<Option<T>, SendError<T>> {
-        let is_closed = self.is_closed();
-        let mut inner = self.inner.borrow_mut();
-        if inner.receiver == 0 {
-            return Ok(Some(value));
-        }
-        if is_closed {
+        if self.is_closed() {
             return Err(SendError(value));
+        }
+        let mut inner = self.inner.borrow_mut();
+        if !inner.receiver {
+            return Ok(Some(value));
         }
         inner.queue.push_back(value);
         if let Some(waker) = inner.waker.take() {
@@ -90,13 +86,30 @@ impl<T> Receiver<T> {
     }
 
     #[inline]
-    pub const fn recv(&self) -> RecvFuture<'_, T> {
-        RecvFuture { rx: self }
+    pub fn try_recv(&self) -> Option<T> {
+        self.inner.borrow_mut().queue.pop_front()
     }
 
     #[inline]
-    pub fn try_recv(&self) -> Option<T> {
-        self.inner.borrow_mut().queue.pop_front()
+    pub async fn recv(&self) -> Result<T, RecvError> {
+        poll_fn(|cx| {
+            let mut inner = self.inner.borrow_mut();
+            if let Some(value) = inner.queue.pop_front() {
+                Poll::Ready(Ok(value))
+            } else {
+                if inner.sender == 0 {
+                    Poll::Ready(Err(RecvError))
+                } else {
+                    if let Some(waker) = inner.waker.as_mut() {
+                        waker.clone_from(cx.waker());
+                    } else {
+                        inner.waker = Some(cx.waker().clone());
+                    }
+                    Poll::Pending
+                }
+            }
+        })
+        .await
     }
 
     #[inline]
@@ -116,41 +129,14 @@ impl<T> Receiver<T> {
         self.inner.borrow().queue.is_empty()
     }
 }
-
 impl<T> Drop for Receiver<T> {
     #[inline]
     fn drop(&mut self) {
-        self.inner.borrow_mut().receiver -= 1;
+        let mut inner = self.inner.borrow_mut();
+        inner.receiver = false;
+        inner.waker = None;
     }
 }
-
-pub struct RecvFuture<'a, T> {
-    rx: &'a Receiver<T>,
-}
-
-impl<'a, T> Future for RecvFuture<'a, T> {
-    type Output = Result<T, RecvError>;
-
-    #[inline]
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut inner = self.rx.inner.borrow_mut();
-        if let Some(value) = inner.queue.pop_front() {
-            Poll::Ready(Ok(value))
-        } else {
-            if inner.sender == 0 {
-                Poll::Ready(Err(RecvError))
-            } else {
-                if let Some(waker) = inner.waker.as_mut() {
-                    waker.clone_from(cx.waker());
-                } else {
-                    inner.waker = Some(cx.waker().clone());
-                }
-                Poll::Pending
-            }
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct InactiveReceiver<T> {
     inner: Rc<RefCell<Inner<T>>>,
@@ -159,7 +145,7 @@ pub struct InactiveReceiver<T> {
 impl<T> InactiveReceiver<T> {
     #[inline]
     pub fn activate(self) -> Receiver<T> {
-        self.inner.borrow_mut().receiver += 1;
+        self.inner.borrow_mut().receiver = true;
         Receiver { inner: self.inner }
     }
 
@@ -180,7 +166,7 @@ pub fn channel<T>() -> (Sender<T>, InactiveReceiver<T>) {
         queue: VecDeque::new(),
         waker: None,
         sender: 1,
-        receiver: 0,
+        receiver: false,
     }));
 
     (

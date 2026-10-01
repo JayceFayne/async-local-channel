@@ -2,9 +2,8 @@ use crate::{RecvError, SendError};
 use alloc::collections::vec_deque::VecDeque;
 use alloc::rc::Rc;
 use core::cell::RefCell;
-use core::future::Future;
-use core::pin::Pin;
-use core::task::{Context, Poll, Waker};
+use core::future::poll_fn;
+use core::task::{Poll, Waker};
 
 #[derive(Debug)]
 struct Inner<T> {
@@ -26,13 +25,12 @@ impl<T> Sender<T> {
 
     #[inline]
     pub fn send(&self, value: T) -> Result<Option<T>, SendError<T>> {
-        let is_closed = self.is_closed();
+        if self.is_closed() {
+            return Err(SendError(value));
+        }
         let mut inner = self.inner.borrow_mut();
         if !inner.receiver {
             return Ok(Some(value));
-        }
-        if is_closed {
-            return Err(SendError(value));
         }
         inner.queue.push_back(value);
         if let Some(waker) = inner.waker.take() {
@@ -74,13 +72,30 @@ impl<T> Receiver<T> {
     }
 
     #[inline]
-    pub const fn recv(&self) -> RecvFuture<'_, T> {
-        RecvFuture { rx: self }
+    pub fn try_recv(&self) -> Option<T> {
+        self.inner.borrow_mut().queue.pop_front()
     }
 
     #[inline]
-    pub fn try_recv(&self) -> Option<T> {
-        self.inner.borrow_mut().queue.pop_front()
+    pub async fn recv(&self) -> Result<T, RecvError> {
+        poll_fn(|cx| {
+            let mut inner = self.inner.borrow_mut();
+            if let Some(value) = inner.queue.pop_front() {
+                Poll::Ready(Ok(value))
+            } else {
+                if self.is_closed() {
+                    Poll::Ready(Err(RecvError))
+                } else {
+                    if let Some(waker) = inner.waker.as_mut() {
+                        waker.clone_from(cx.waker());
+                    } else {
+                        inner.waker = Some(cx.waker().clone());
+                    }
+                    Poll::Pending
+                }
+            }
+        })
+        .await
     }
 
     #[inline]
@@ -101,30 +116,12 @@ impl<T> Receiver<T> {
     }
 }
 
-pub struct RecvFuture<'a, T> {
-    rx: &'a Receiver<T>,
-}
-
-impl<'a, T> Future for RecvFuture<'a, T> {
-    type Output = Result<T, RecvError>;
-
+impl<T> Drop for Receiver<T> {
     #[inline]
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut inner = self.rx.inner.borrow_mut();
-        if let Some(value) = inner.queue.pop_front() {
-            Poll::Ready(Ok(value))
-        } else {
-            if Rc::strong_count(&self.rx.inner) == 1 {
-                Poll::Ready(Err(RecvError))
-            } else {
-                if let Some(waker) = inner.waker.as_mut() {
-                    waker.clone_from(cx.waker());
-                } else {
-                    inner.waker = Some(cx.waker().clone());
-                }
-                Poll::Pending
-            }
-        }
+    fn drop(&mut self) {
+        let mut inner = self.inner.borrow_mut();
+        inner.receiver = false;
+        inner.waker = None;
     }
 }
 
