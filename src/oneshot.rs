@@ -1,19 +1,17 @@
 use crate::{RecvError, SendError};
 use alloc::rc::Rc;
-use core::cell::RefCell;
+use core::cell::Cell;
+use core::fmt;
 use core::future::poll_fn;
 use core::task::{Poll, Waker};
 
-#[derive(Debug)]
 struct Inner<T> {
-    value: Option<T>,
-    waker: Option<Waker>,
-    receiver: bool,
+    value: Cell<Option<T>>,
+    waker: Cell<Option<Waker>>,
 }
 
-#[derive(Debug)]
 pub struct Sender<T> {
-    inner: Rc<RefCell<Inner<T>>>,
+    inner: Rc<Inner<T>>,
 }
 
 impl<T> Sender<T> {
@@ -27,12 +25,8 @@ impl<T> Sender<T> {
         if self.is_closed() {
             return Err(SendError(value));
         }
-        let mut inner = self.inner.borrow_mut();
-        if !inner.receiver {
-            return Ok(Some(value));
-        }
-        inner.value = Some(value);
-        if let Some(waker) = inner.waker.take() {
+        self.inner.value.set(Some(value));
+        if let Some(waker) = self.inner.waker.take() {
             waker.wake();
         }
         Ok(None)
@@ -42,16 +36,20 @@ impl<T> Sender<T> {
 impl<T> Drop for Sender<T> {
     #[inline]
     fn drop(&mut self) {
-        let mut inner = self.inner.borrow_mut();
-        if let Some(waker) = inner.waker.take() {
+        if let Some(waker) = self.inner.waker.take() {
             waker.wake();
         }
     }
 }
 
-#[derive(Debug)]
+impl<T> fmt::Debug for Sender<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Sender").finish()
+    }
+}
+
 pub struct Receiver<T> {
-    inner: Rc<RefCell<Inner<T>>>,
+    inner: Rc<Inner<T>>,
 }
 
 impl<T> Receiver<T> {
@@ -61,75 +59,54 @@ impl<T> Receiver<T> {
     }
 
     #[inline]
-    pub fn try_recv(&self) -> Option<T> {
-        self.inner.borrow_mut().value.take()
-    }
-
-    #[inline]
-    pub async fn recv(&self) -> Result<T, RecvError> {
+    pub async fn recv(self) -> Result<T, RecvError> {
         poll_fn(|cx| {
-            let mut inner = self.inner.borrow_mut();
-            if let Some(value) = inner.value.take() {
+            if let Some(value) = self.inner.value.take() {
                 Poll::Ready(Ok(value))
             } else {
                 if self.is_closed() {
                     Poll::Ready(Err(RecvError))
                 } else {
-                    if let Some(waker) = inner.waker.as_mut() {
+                    let waker = if let Some(mut waker) = self.inner.waker.take() {
                         waker.clone_from(cx.waker());
+                        waker
                     } else {
-                        inner.waker = Some(cx.waker().clone());
-                    }
+                        cx.waker().clone()
+                    };
+                    self.inner.waker.set(Some(waker));
                     Poll::Pending
                 }
             }
         })
         .await
     }
-
-    #[inline]
-    pub fn deactivate(self) -> InactiveReceiver<T> {
-        InactiveReceiver {
-            inner: self.inner.clone(),
-        }
-    }
 }
 
 impl<T> Drop for Receiver<T> {
     #[inline]
     fn drop(&mut self) {
-        let mut inner = self.inner.borrow_mut();
-        inner.receiver = false;
-        inner.waker = None;
+        self.inner.waker.take();
     }
 }
 
-#[derive(Debug)]
-pub struct InactiveReceiver<T> {
-    inner: Rc<RefCell<Inner<T>>>,
-}
-
-impl<T> InactiveReceiver<T> {
-    #[inline]
-    pub fn activate(self) -> Receiver<T> {
-        self.inner.borrow_mut().receiver = true;
-        Receiver { inner: self.inner }
+impl<T> fmt::Debug for Receiver<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Receiver").finish()
     }
 }
 
 #[inline]
-pub fn channel<T>() -> (Sender<T>, InactiveReceiver<T>) {
-    let inner = Rc::new(RefCell::new(Inner {
-        value: None,
-        waker: None,
-        receiver: false,
-    }));
+pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
+    let inner = Rc::new(Inner {
+        value: Cell::new(None),
+        waker: Cell::new(None),
+    });
 
     (
         Sender {
             inner: inner.clone(),
         },
-        InactiveReceiver { inner },
+        Receiver { inner },
     )
 }
 
@@ -142,7 +119,6 @@ mod tests {
     #[tokio::test(flavor = "local")]
     async fn send_before() {
         let (tx, rx) = channel();
-        let rx = rx.activate();
         tx.send(true).unwrap();
         spawn_local(async move {
             assert!(rx.recv().await.unwrap());
@@ -154,7 +130,6 @@ mod tests {
     #[tokio::test(flavor = "local")]
     async fn send_after() {
         let (tx, rx) = channel::<bool>();
-        let rx = rx.activate();
         let handle = spawn_local(async move {
             assert!(rx.recv().await.unwrap());
         });

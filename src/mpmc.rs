@@ -7,22 +7,27 @@ use core::task::{Poll, Waker};
 use slotmap::{DefaultKey, Key, SlotMap};
 
 #[derive(Debug)]
-struct Inner<T> {
+struct State<T> {
     queue: VecDeque<T>,
     waker: SlotMap<DefaultKey, Waker>,
-    sender: usize,
-    receiver: usize,
+}
+
+#[derive(Debug)]
+struct Inner<T> {
+    state: RefCell<State<T>>,
+    sender: Cell<usize>,
+    receiver: Cell<usize>,
 }
 
 #[derive(Debug)]
 pub struct Sender<T> {
-    inner: Rc<RefCell<Inner<T>>>,
+    inner: Rc<Inner<T>>,
 }
 
 impl<T> Sender<T> {
     #[inline]
     pub fn is_closed(&self) -> bool {
-        Rc::strong_count(&self.inner) == self.inner.borrow().sender
+        Rc::strong_count(&self.inner) == self.inner.sender.get()
     }
 
     #[inline]
@@ -30,12 +35,12 @@ impl<T> Sender<T> {
         if self.is_closed() {
             return Err(SendError(value));
         }
-        let mut inner = self.inner.borrow_mut();
-        if inner.receiver == 0 {
+        if self.inner.receiver.get() == 0 {
             return Ok(Some(value));
         }
-        inner.queue.push_back(value);
-        for (_, waker) in inner.waker.drain() {
+        let mut state = self.inner.state.borrow_mut();
+        state.queue.push_back(value);
+        for (_, waker) in state.waker.drain() {
             waker.wake();
         }
         Ok(None)
@@ -43,19 +48,19 @@ impl<T> Sender<T> {
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.inner.borrow().queue.len()
+        self.inner.state.borrow().queue.len()
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.inner.borrow().queue.is_empty()
+        self.inner.state.borrow().queue.is_empty()
     }
 }
 
 impl<T> Clone for Sender<T> {
     #[inline]
     fn clone(&self) -> Self {
-        self.inner.borrow_mut().sender += 1;
+        self.inner.sender.update(|s| s + 1);
         Self {
             inner: self.inner.clone(),
         }
@@ -65,10 +70,9 @@ impl<T> Clone for Sender<T> {
 impl<T> Drop for Sender<T> {
     #[inline]
     fn drop(&mut self) {
-        let mut inner = self.inner.borrow_mut();
-        inner.sender -= 1;
-        if inner.sender == 0 {
-            for (_, waker) in inner.waker.drain() {
+        self.inner.sender.update(|s| s - 1);
+        if self.inner.sender.get() == 0 {
+            for (_, waker) in self.inner.state.borrow_mut().waker.drain() {
                 waker.wake();
             }
         }
@@ -77,13 +81,13 @@ impl<T> Drop for Sender<T> {
 
 #[derive(Debug)]
 pub struct Receiver<T> {
-    inner: Rc<RefCell<Inner<T>>>,
+    inner: Rc<Inner<T>>,
     waker_key: Cell<DefaultKey>,
 }
 
 impl<T> Receiver<T> {
-    fn new(inner: Rc<RefCell<Inner<T>>>) -> Receiver<T> {
-        inner.borrow_mut().receiver += 1;
+    fn new(inner: Rc<Inner<T>>) -> Receiver<T> {
+        inner.receiver.update(|s| s + 1);
         Self {
             inner,
             waker_key: Cell::new(DefaultKey::null()),
@@ -92,28 +96,28 @@ impl<T> Receiver<T> {
 
     #[inline]
     pub fn is_closed(&self) -> bool {
-        self.inner.borrow().sender == 0
+        self.inner.sender.get() == 0
     }
 
     #[inline]
     pub fn try_recv(&self) -> Option<T> {
-        self.inner.borrow_mut().queue.pop_front()
+        self.inner.state.borrow_mut().queue.pop_front()
     }
 
     #[inline]
     pub async fn recv(&self) -> Result<T, RecvError> {
         poll_fn(|cx| {
-            let mut inner = self.inner.borrow_mut();
-            if let Some(value) = inner.queue.pop_front() {
+            let mut state = self.inner.state.borrow_mut();
+            if let Some(value) = state.queue.pop_front() {
                 Poll::Ready(Ok(value))
             } else {
-                if inner.sender == 0 {
+                if self.is_closed() {
                     Poll::Ready(Err(RecvError))
                 } else {
-                    if let Some(waker) = inner.waker.get_mut(self.waker_key.get()) {
+                    if let Some(waker) = state.waker.get_mut(self.waker_key.get()) {
                         waker.clone_from(cx.waker());
                     } else {
-                        self.waker_key.set(inner.waker.insert(cx.waker().clone()));
+                        self.waker_key.set(state.waker.insert(cx.waker().clone()));
                     }
                     Poll::Pending
                 }
@@ -131,12 +135,12 @@ impl<T> Receiver<T> {
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.inner.borrow().queue.len()
+        self.inner.state.borrow().queue.len()
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.inner.borrow().queue.is_empty()
+        self.inner.state.borrow().queue.is_empty()
     }
 }
 
@@ -150,15 +154,18 @@ impl<T> Clone for Receiver<T> {
 impl<T> Drop for Receiver<T> {
     #[inline]
     fn drop(&mut self) {
-        let mut inner = self.inner.borrow_mut();
-        inner.receiver -= 1;
-        inner.waker.remove(self.waker_key.get());
+        self.inner.receiver.update(|s| s - 1);
+        self.inner
+            .state
+            .borrow_mut()
+            .waker
+            .remove(self.waker_key.get());
     }
 }
 
 #[derive(Debug)]
 pub struct InactiveReceiver<T> {
-    inner: Rc<RefCell<Inner<T>>>,
+    inner: Rc<Inner<T>>,
 }
 
 impl<T> Clone for InactiveReceiver<T> {
@@ -178,23 +185,25 @@ impl<T> InactiveReceiver<T> {
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.inner.borrow().queue.len()
+        self.inner.state.borrow().queue.len()
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.inner.borrow().queue.is_empty()
+        self.inner.state.borrow().queue.is_empty()
     }
 }
 
 #[inline]
 pub fn channel<T>() -> (Sender<T>, InactiveReceiver<T>) {
-    let inner = Rc::new(RefCell::new(Inner {
-        queue: VecDeque::new(),
-        waker: SlotMap::new(),
-        sender: 1,
-        receiver: 0,
-    }));
+    let inner = Rc::new(Inner {
+        state: RefCell::new(State {
+            queue: VecDeque::new(),
+            waker: SlotMap::new(),
+        }),
+        sender: Cell::new(1),
+        receiver: Cell::new(0),
+    });
 
     (
         Sender {

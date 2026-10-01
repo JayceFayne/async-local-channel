@@ -1,27 +1,26 @@
 use crate::{RecvError, SendError};
 use alloc::collections::vec_deque::VecDeque;
 use alloc::rc::Rc;
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
+use core::fmt;
 use core::future::poll_fn;
 use core::task::{Poll, Waker};
 
-#[derive(Debug)]
 struct Inner<T> {
-    queue: VecDeque<T>,
-    waker: Option<Waker>,
-    sender: usize,
-    receiver: bool,
+    queue: RefCell<VecDeque<T>>,
+    waker: Cell<Option<Waker>>,
+    sender: Cell<usize>,
+    receiver: Cell<bool>,
 }
 
-#[derive(Debug)]
 pub struct Sender<T> {
-    inner: Rc<RefCell<Inner<T>>>,
+    inner: Rc<Inner<T>>,
 }
 
 impl<T> Sender<T> {
     #[inline]
     pub fn is_closed(&self) -> bool {
-        Rc::strong_count(&self.inner) == self.inner.borrow().sender
+        Rc::strong_count(&self.inner) == self.inner.sender.get()
     }
 
     #[inline]
@@ -29,12 +28,11 @@ impl<T> Sender<T> {
         if self.is_closed() {
             return Err(SendError(value));
         }
-        let mut inner = self.inner.borrow_mut();
-        if !inner.receiver {
+        if !self.inner.receiver.get() {
             return Ok(Some(value));
         }
-        inner.queue.push_back(value);
-        if let Some(waker) = inner.waker.take() {
+        self.inner.queue.borrow_mut().push_back(value);
+        if let Some(waker) = self.inner.waker.take() {
             waker.wake();
         }
         Ok(None)
@@ -42,19 +40,19 @@ impl<T> Sender<T> {
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.inner.borrow().queue.len()
+        self.inner.queue.borrow().len()
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.inner.borrow().queue.is_empty()
+        self.inner.queue.borrow().is_empty()
     }
 }
 
 impl<T> Clone for Sender<T> {
     #[inline]
     fn clone(&self) -> Self {
-        self.inner.borrow_mut().sender += 1;
+        self.inner.sender.update(|s| s + 1);
         Self {
             inner: self.inner.clone(),
         }
@@ -64,47 +62,52 @@ impl<T> Clone for Sender<T> {
 impl<T> Drop for Sender<T> {
     #[inline]
     fn drop(&mut self) {
-        let mut inner = self.inner.borrow_mut();
-        inner.sender -= 1;
-        if inner.sender == 0
-            && let Some(waker) = inner.waker.take()
+        self.inner.sender.update(|s| s - 1);
+        if self.inner.sender.get() == 0
+            && let Some(waker) = self.inner.waker.take()
         {
             waker.wake();
         }
     }
 }
 
-#[derive(Debug)]
+impl<T> fmt::Debug for Sender<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Sender").finish()
+    }
+}
+
 pub struct Receiver<T> {
-    inner: Rc<RefCell<Inner<T>>>,
+    inner: Rc<Inner<T>>,
 }
 
 impl<T> Receiver<T> {
     #[inline]
     pub fn is_closed(&self) -> bool {
-        self.inner.borrow().sender == 0
+        self.inner.sender.get() == 0
     }
 
     #[inline]
     pub fn try_recv(&self) -> Option<T> {
-        self.inner.borrow_mut().queue.pop_front()
+        self.inner.queue.borrow_mut().pop_front()
     }
 
     #[inline]
     pub async fn recv(&self) -> Result<T, RecvError> {
         poll_fn(|cx| {
-            let mut inner = self.inner.borrow_mut();
-            if let Some(value) = inner.queue.pop_front() {
+            if let Some(value) = self.inner.queue.borrow_mut().pop_front() {
                 Poll::Ready(Ok(value))
             } else {
-                if inner.sender == 0 {
+                if self.inner.sender.get() == 0 {
                     Poll::Ready(Err(RecvError))
                 } else {
-                    if let Some(waker) = inner.waker.as_mut() {
+                    let waker = if let Some(mut waker) = self.inner.waker.take() {
                         waker.clone_from(cx.waker());
+                        waker
                     } else {
-                        inner.waker = Some(cx.waker().clone());
-                    }
+                        cx.waker().clone()
+                    };
+                    self.inner.waker.set(Some(waker));
                     Poll::Pending
                 }
             }
@@ -121,53 +124,64 @@ impl<T> Receiver<T> {
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.inner.borrow().queue.len()
+        self.inner.queue.borrow().len()
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.inner.borrow().queue.is_empty()
+        self.inner.queue.borrow().is_empty()
     }
 }
 impl<T> Drop for Receiver<T> {
     #[inline]
     fn drop(&mut self) {
-        let mut inner = self.inner.borrow_mut();
-        inner.receiver = false;
-        inner.waker = None;
+        self.inner.receiver.set(false);
+        self.inner.waker.take();
     }
 }
-#[derive(Debug)]
+
+impl<T> fmt::Debug for Receiver<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Receiver").finish()
+    }
+}
+
 pub struct InactiveReceiver<T> {
-    inner: Rc<RefCell<Inner<T>>>,
+    inner: Rc<Inner<T>>,
 }
 
 impl<T> InactiveReceiver<T> {
     #[inline]
     pub fn activate(self) -> Receiver<T> {
-        self.inner.borrow_mut().receiver = true;
+        self.inner.receiver.set(true);
         Receiver { inner: self.inner }
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.inner.borrow().queue.len()
+        self.inner.queue.borrow().len()
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.inner.borrow().queue.is_empty()
+        self.inner.queue.borrow().is_empty()
+    }
+}
+
+impl<T> fmt::Debug for InactiveReceiver<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InactiveReceiver").finish()
     }
 }
 
 #[inline]
 pub fn channel<T>() -> (Sender<T>, InactiveReceiver<T>) {
-    let inner = Rc::new(RefCell::new(Inner {
-        queue: VecDeque::new(),
-        waker: None,
-        sender: 1,
-        receiver: false,
-    }));
+    let inner = Rc::new(Inner {
+        queue: RefCell::new(VecDeque::new()),
+        waker: Cell::new(None),
+        sender: Cell::new(1),
+        receiver: Cell::new(false),
+    });
 
     (
         Sender {
