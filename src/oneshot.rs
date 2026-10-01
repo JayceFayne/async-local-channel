@@ -59,7 +59,12 @@ impl<T> Receiver<T> {
     }
 
     #[inline]
-    pub async fn recv(self) -> Result<T, RecvError> {
+    pub fn try_recv(&self) -> Option<T> {
+        self.inner.value.take()
+    }
+
+    #[inline]
+    pub async fn recv(&self) -> Result<T, RecvError> {
         poll_fn(|cx| {
             if let Some(value) = self.inner.value.take() {
                 Poll::Ready(Ok(value))
